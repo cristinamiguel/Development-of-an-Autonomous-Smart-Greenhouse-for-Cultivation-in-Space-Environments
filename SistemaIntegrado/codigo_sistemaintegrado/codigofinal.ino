@@ -3,6 +3,7 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_MCP23X17.h>
 #include <BH1750.h>
+#include <DFRobot_OxygenSensor.h>
 
 // -------------------------------------------------------------------------
 // Configurações gerais e hardware
@@ -10,6 +11,7 @@
 Adafruit_MCP23X17 mcp; 
 Adafruit_BME280 bme; 
 BH1750 lightMeter; 
+DFRobot_OxygenSensor oxygen;
 
 // Pinos Diretos no TTGO
 #define PH_PIN 35      // Sonda de pH 
@@ -53,8 +55,8 @@ const float LIMITE_HUM_OK    = 50.0;       // Humidade segura para desligar
 
 // Subsistema 2: Iluminação e Fotoperíodo (BH1750)
 const float THRESHOLD_LUZ = 50.0;          
-const unsigned long DURACAO_DIA = 20000;   // 20s de simulação
-const unsigned long DURACAO_NOITE = 10000; // 10s de simulação 
+const unsigned long DURACAO_DIA = 20000;   // 20s de simulação (depois seria passado para as 16horas do tempo real) -> a variável está em milissegundos
+const unsigned long DURACAO_NOITE = 10000; // 10s de simulação (depois troca-se para as 8horas do tempo real)
 unsigned long tempoTransicaoLuz = 0;
 bool eDia = true;                          
 
@@ -64,16 +66,24 @@ const int Valor_Agua = 1600;
 bool regaEmCurso = false;
 unsigned long tempoInicioRega = 0;
 const unsigned long TEMPO_REGA = 4000;     // Reduzido para 4s para prevenir contra os resets elétricos
+// estas variáveis do subsistema "de humidade servem para detetar se o sensor "congelou"
+int leituraSoloAnterior = -1; //valor negativo porque o sensor analógico nunca devolve valor negativo assim leituraSoloReal nunca será ==-1 (leituraSoloAnterior)
+int contadorCongeladoSolo = 0;
+bool modoDemoSoloAtivo = false;  
+int humidadeSimulada_Demo = 55;
 
 // Subsistema 4: Controlo de pH (Nutrientes)
 const float VOLTAGEM_PH7 = 1.61;           
 const float DECLIVE_PH = 5.66;             
 float phSimulado_Demo = 8.2;               
-bool forçarDemoPH = true;          // <<< esta linha é para ter sempre uma demonstração
+// variáveis do subsistema de pH servem para detetar se o sensor "congelou"
+int leituraPHAnterior = -1;
+int contadorCongeladoPH = 0;
+bool modoDemoPHAtivo = false;
 
 // Subsistema 5: Atmosfera (CO2 / O2)
 float o2Simulado_Demo = 21.02;             
-bool modoDemoAtivo = true;                 
+bool sensorO2Operacional = false;    // Variável para saber se o sensor real está vivo            
 
 // -------------------------------------------------------------------------
 // Setup
@@ -109,6 +119,15 @@ void setup() {
   } else {
     Serial.println("ERRO CRÍTICO: BH1750 não encontrado!");
     while (1); 
+  }
+
+  //  Inicializar Sensor Oxigénio
+  if (oxygen.begin(OXYGEN_I2C_ADDRESS)) {
+    Serial.println("--- Sensor de Oxigénio detetado e Operacional ---");
+    sensorO2Operacional = true;  // Usa o hardware real!
+  } else {
+    Serial.println("!!! AVISO: Sensor de O2 ausente. Modo Simulação Ativado!");
+    sensorO2Operacional = false; // Fallback automático -> passa logo para a demonstração
   }
 
   // Configurei as saídas do Expansor e forcei o estado OFF por segurança (HIGH)
@@ -204,26 +223,48 @@ void loop() {
   // -----------------------------------------------------------------------
   // SUBSISTEMA 3: Irrigação do Solo (SENSOR CAPACITIVO e MOSFET)
   // -----------------------------------------------------------------------
-  if (!regaEmCurso) {
+ if (!regaEmCurso) {
     if (tempoAtual - ultimoTempoSolo >= INTERVALO_SOLO) {
       ultimoTempoSolo = tempoAtual;
       Serial.println("\n[SUBSISTEMA 3 - HUMIDADE DO SOLO]");
       
-      int lecturaSolo = analogRead(SOLO_PIN); 
-      int humidadeSolo = map(lecturaSolo, Valor_Seco, Valor_Agua, 0, 100);
-      humidadeSolo = constrain(humidadeSolo, 0, 100); 
+      int leituraSoloReal = analogRead(SOLO_PIN); 
+      // Lógica de Congelamento: 3 leituras idênticas (ciclos seguidos) ativam a Demonstração
+      if (leituraSoloReal == leituraSoloAnterior) {
+        contadorCongeladoSolo++;
+        if (contadorCongeladoSolo >= 3) { 
+          modoDemoSoloAtivo = true;
+        }
+      } else {
+        contadorCongeladoSolo = 0;
+        modoDemoSoloAtivo = false;
+        leituraSoloAnterior = leituraSoloReal;
+      }
 
-      Serial.print("-> Solo Humidade: "); 
-      Serial.print(humidadeSolo); 
-      Serial.println("%"); 
+      int humidadeSolo = 0;
+
+      if (!modoDemoSoloAtivo) {
+        humidadeSolo = map(leituraSoloReal, Valor_Seco, Valor_Agua, 0, 100);
+        humidadeSolo = constrain(humidadeSolo, 0, 100); 
+        Serial.print("-> [Sinal Real] Solo Humidade: "); 
+        Serial.print(humidadeSolo); 
+        Serial.println("%");
+      } else {
+        humidadeSolo = humidadeSimulada_Demo;
+        Serial.print("-> [Sensor Congelado - MODO DEMONSTRAÇÃO ATIVO] Solo Humidade Simulada: "); 
+        Serial.print(humidadeSolo);
+        Serial.println("%");
+      }
 
       if (humidadeSolo < 40) { 
-        Serial.println("-> ALERTA: Solo Seco! Disparando Bomba Submersível isoladamente..."); 
-        digitalWrite(PINO_MOSFET, HIGH); // Ligar o MOSFET 
+        Serial.println("-> ALERTA: Solo Seco! Disparar Bomba Submersível via MOSFET..."); 
+        digitalWrite(PINO_MOSFET, HIGH); 
         regaEmCurso = true;
         tempoInicioRega = tempoAtual;
+        if (modoDemoSoloAtivo) humidadeSimulada_Demo = 75; // Recupera humidade na demonstração
       } else if (humidadeSolo >= 70) {
-        digitalWrite(PINO_MOSFET, LOW); 
+        digitalWrite(PINO_MOSFET, LOW);
+        if (modoDemoSoloAtivo) humidadeSimulada_Demo = 35; // Seca no próximo ciclo de demonstração
       }
     }
   } else {
@@ -232,7 +273,7 @@ void loop() {
       digitalWrite(PINO_MOSFET, LOW); // Desligar a bomba após o tempo de rega 
       regaEmCurso = false;
       ultimoTempoSolo = tempoAtual; // Adicionar margem para a próxima leitura
-      Serial.println("-> Fluxo de irrigação concluído. Voltando à monitorização.");
+      Serial.println("-> Fluxo de irrigação concluído. A regressar à monitorização.");
     }
   }
 
@@ -244,59 +285,74 @@ void loop() {
     ultimoTempoPH = tempoAtual;
     Serial.println("\n[SUBSISTEMA 4 - ESTABILIZAÇÃO DE pH]");
     
-    // Deixar a leitura física aqui para o caso de o "else" ser ativado
-    int leituraPH = 0; 
-    for(int i=0; i<10; i++) { leituraPH += analogRead(PH_PIN); delay(10); } 
-    leituraPH /= 10;
+    // Deixar a leitura física aqui para o caso de o "else" seja ativado
+    int leituraPHReal = 0; 
+    for(int i=0; i<10; i++) { leituraPHReal += analogRead(PH_PIN); delay(10); } 
+    leituraPHReal /= 10;
 
-    float voltagemPH = leituraPH * (3.3 / 4095.0); 
-    float valorPHReal = 7.0 + (VOLTAGEM_PH7 - voltagemPH) * DECLIVE_PH; 
-    valorPHReal = constrain(valorPHReal, 0.0, 14.0); 
+    // Lógica de Congelamento: Verifica se o valor analógico não mexe nada
+    if (leituraPHReal == leituraPHAnterior) {
+      contadorCongeladoPH++;
+      if (contadorCongeladoPH >= 3) { 
+        modoDemoPHAtivo = true;
+      }
+    } else {
+      contadorCongeladoPH = 0;
+      modoDemoPHAtivo = false;
+      leituraPHAnterior = leituraPHReal;
+    }
 
-    // --- SE FORÇAR A DEMONSTRAÇÃO POR CÓDIGO ---
-    // Comentar esta secção para testar a sonda real
-    if (true) { 
-      Serial.print("-> [pH SYSTEM - MODO DEMO ATIVO] pH Atual no Copo: "); Serial.println(phSimulado_Demo, 2);
+    // Se o sensor estiver congelado, corre a simulação para ver o atuador a dar
+    if (modoDemoPHAtivo) { 
+      Serial.print("-> [CONGELADO - MODO DEMONSTRAÇÃO ATIVO] pH Simulado para Demonstração: "); 
+      Serial.println(phSimulado_Demo, 2);
 
       if (phSimulado_Demo > 6.5) { 
-        Serial.println("-> ALERTA: pH Alto! A ativar A4 (IN5 - Bomba de Ácido)..."); 
+        Serial.println("-> ALERTA: pH Alto! Ativar Bomba Peristáltica de Ácido (IN5)..."); 
         mcp.digitalWrite(PINO_EXP_ACIDO, LOW); 
-        delay(2000);                          
+        delay(2000);                                   
         mcp.digitalWrite(PINO_EXP_ACIDO, HIGH); 
         phSimulado_Demo -= 0.5; 
-        Serial.println("-> Dose de pH Down aplicada com sucesso."); 
       } 
       else if (phSimulado_Demo < 5.5) {
-        Serial.println("-> ALERTA: pH Baixo! A ativar A5 (IN6 - Bomba de Base)..."); 
+        Serial.println("-> ALERTA: pH Baixo! Ativar Bomba Peristáltica de Base (IN6)..."); 
         mcp.digitalWrite(PINO_EXP_BASE, LOW);  
-        delay(2000);                          
+        delay(2000);                                   
         mcp.digitalWrite(PINO_EXP_BASE, HIGH); 
         phSimulado_Demo += 0.4; 
-        Serial.println("-> Dose de pH Up aplicada com sucesso."); 
       } 
       else {
         Serial.println("-> pH quimicamente estabilizado em 6.0 (Ideal). Bombas em repouso."); 
         phSimulado_Demo = 8.2; 
       }
     } 
-    // --- MODO REAL (SÓ CORRE SE MUDARES O 'if(true)' PARA 'if(false)') ---
+    // SE O SENSOR REAL ESTIVER VIVO E A MEXER NA ÁGUA
     else {
-      Serial.print("-> [pH SYSTEM - REAL] Voltagem: "); 
+      float voltagemPH = leituraPHReal * (3.3 / 4095.0); 
+      float valorPHReal = 7.0 + (VOLTAGEM_PH7 - voltagemPH) * DECLIVE_PH; 
+      valorPHReal = constrain(valorPHReal, 0.0, 14.0); 
+
+      Serial.print("-> [Sinal Real]     Tensão: "); 
       Serial.print(voltagemPH); 
-      Serial.print("V | pH Calculado: "); 
+      Serial.print("V | pH Real Calculado: "); 
       Serial.println(valorPHReal, 2); 
       
       if (valorPHReal > 6.5) { 
+        Serial.println("-> ALERTA REAL: pH Alto detetado na sonda. Dosear Ácido por 2s...");
         mcp.digitalWrite(PINO_EXP_ACIDO, LOW); 
         delay(2000); 
         mcp.digitalWrite(PINO_EXP_ACIDO, HIGH); 
+
       } else if (valorPHReal < 5.5) { 
+        Serial.println("-> ALERTA REAL: pH Baixo detetado na sonda. Dosear Base por 2s...");
         mcp.digitalWrite(PINO_EXP_BASE, LOW); 
         delay(2000); 
         mcp.digitalWrite(PINO_EXP_BASE, HIGH); 
+      } else {
+        Serial.println("-> pH Real estável na faixa segura. Atuadores em repouso.");
       }
     }
-  } 
+  }
 // -----------------------------------------------------------------------
   // SUBSISTEMA 5: Atmosfera/CO2/O2 (MODO DEMONSTRAÇÃO DIRETAMENTE)
   // -----------------------------------------------------------------------
@@ -304,33 +360,48 @@ void loop() {
     ultimoTempoAtmosfera = tempoAtual;
     Serial.println("\n[SUBSISTEMA 5 - ATMOSFERA E INJEÇÃO CO2]");
     
-    // Converte o Oxigénio Simulado da Demo diretamente para a fórmula que tinha no relatório intermédio
-    float co2EstimadoPPM = 400.0 + (21.0 - o2Simulado_Demo) * 10000.0;
+    float o2Lido = 0.0;
+
+    // tenta o real, se não der, simula
+    if (sensorO2Operacional) {
+      o2Lido = oxygen.getOxygenData(); // Lê a percentagem real do sensor DFRobot
+      Serial.print("-> [SINAL REAL] Oxigénio Lido no Sensor: "); 
+      Serial.print(o2Lido, 2); 
+      Serial.println("%");
+    } else {
+      o2Lido = o2Simulado_Demo;        // Usa a simulação para o código não crashar
+      Serial.print("-> [MODO CONTINGÊNCIA] Oxigénio Simulado: "); 
+      Serial.print(o2Lido, 2); 
+      Serial.println("%");
+    }
+
+    float co2EstimadoPPM = 400.0 + (21.0 - o2Lido) * 10000.0;
     if (co2EstimadoPPM < 0) co2EstimadoPPM = 400.0;
 
-    Serial.print("-> Oxigénio Simulado em Exibição: "); Serial.print(o2Simulado_Demo, 2); Serial.println("%");
-    Serial.print("-> Dióxido de Carbono Calculado: "); Serial.print(co2EstimadoPPM, 0); Serial.println(" ppm");
+    Serial.print("-> Dióxido de Carbono Calculado: "); Serial.print(co2EstimadoPPM, 0); 
+    Serial.println(" ppm");
 
     if (co2EstimadoPPM < 800) {
       Serial.println("-> ALERTA TR1: CO2 < 800 ppm! Abrir Válvula Solenoide por 4s...");
-      mcp.digitalWrite(PINO_EXP_VALV_CO2, LOW);  // Liga o relé -> Abre a válvula
-      delay(4000);                               // Pulso nítido de 4s para o vídeo
-      mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); // Desliga o relé -> Fecha a válvula
+      mcp.digitalWrite(PINO_EXP_VALV_CO2, LOW);  
+      delay(4000);                               
+      mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); 
       Serial.println("-> Injeção de gás concluída. Válvula selada.");
       
-      o2Simulado_Demo = 20.93; // Passa para o valor estável (1100 ppm) na próxima iteração
+      // Se estiver em modo simulação, altera a variável para vermos a reação no próximo ciclo
+      if (!sensorO2Operacional) o2Simulado_Demo = 20.93; 
     } 
     else if (co2EstimadoPPM >= 1200) {
-      Serial.println("-> CRÍTICO: CO2 >= 1200 ppm. Garantindo válvula FECHADA (LED IN8 OFF).");
+      Serial.println("-> CRÍTICO: CO2 >= 1200 ppm. Garantir válvula FECHADA (LED IN8 OFF).");
       mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);
       
-      o2Simulado_Demo = 21.02; // Altera para forçar uma queda drástica abaixo dos 800 ppm e vermos a valvula a trabalhar
+      if (!sensorO2Operacional) o2Simulado_Demo = 21.02; 
     } 
     else {
       Serial.println("-> Nível de CO2 estável na meta [800 - 1200] ppm. Válvula em repouso.");
       mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);
       
-      o2Simulado_Demo = 20.89; // Altera para forçar uma subida crítica acima dos 1200 ppm
+      if (!sensorO2Operacional) o2Simulado_Demo = 20.89; 
     }
   }
 }
