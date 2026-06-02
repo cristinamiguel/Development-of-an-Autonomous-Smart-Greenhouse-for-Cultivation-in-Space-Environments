@@ -4,76 +4,124 @@
 // configurar expansor
 Adafruit_MCP23X17 mcp;
 
-
 const int PINO_EXP_VALV_CO2 = 7; // Pino A7 do expansor (para o IN8 do Relé)
 
-// Variável de controlo -> para demonstração
-float o2Simulado_Demo = 20.93; // começa no valor ideal que medi (1100 ppm)
-bool modoDemoAtivo = true;     // altera para "false" se quiser as leituras reais brutas
+// Variáveis de controlo para passar para a Demonstração
+bool modoDemoAtivo = false; 
+int contadorEstavel = 0;       // Conta quantas leituras seguidas dão estáveis
+int passoDemo = 1;             // Controla as fases da demonstração forçada
+float o2Simulado_Demo = 21.05; // Valor inicial da demo para forçar CO2 baixo (0 ppm)
 
 void setup() {
   Serial.begin(115200);
   
-  // Inicializar o barramento I2C e o Expansor MCP23017
+  // Inicializar o Expansor MCP23017
   if (!mcp.begin_I2C()) {
     Serial.println("-> ERRO: Expansor MCP23017 não encontrado!");
     while (1); 
   }
 
-  // Configurar o pino da válvula como saída e garantir que começa fechada (HIGH)
+  // Configurar o pino da válvula como saída e garantir que começa fechada
   mcp.pinMode(PINO_EXP_VALV_CO2, OUTPUT);   
-  mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); // Fio no NO do relé: HIGH desliga o relé -> Válvula fecha
-
-  Serial.println("\n_________________________________________________________________");
-  Serial.println("--- SUBSISTEMA DE CO2: MODO DE DEMONSTRAÇÃO COM VÁLVULA ATIVA ---");
-  Serial.println("_________________________________________________________________");
+  mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); // HIGH mantém o relé desligado -> Válvula selada
 }
 
 void loop() {
   Serial.println("\n--- Nova Leitura dos níveis atmosféricos ---");
 
-  // Leitura real do sensor
-  float leituraO2Real = 20.93; // Base estável do interior do quarto (janela aberta)
-  // Aqui a biblioteca lê o valor real
+  float leituraO2Final;
 
-  float leituraO2Final = leituraO2Real;
-
-  // Lógica de modo de demonstração (Igual ao que fiz no algoritmo do subsistema de pH)
-  if (modoDemoAtivo) {
-    Serial.println("-> [MODO DEMONSTRAÇÃO ATIVO]: A forçar flutuação para exibir o atuador em funcionamento.");
+  if (!modoDemoAtivo) {
+    //Leitura Real (Ambiente equilibrado)
+    float leituraO2Real = 20.93; 
+    leituraO2Final = leituraO2Real;
+  } else {
+    // Demonstração Ativada
+    Serial.print("-> [Aviso]: Sistema Real estável há muito tempo. MODO DEMO ATIVO (Passo ");
+    Serial.print(passoDemo); Serial.println(")");
     leituraO2Final = o2Simulado_Demo;
   }
 
-  // Fórmula de conversão de CO2 para O2 (Inverso do que ocorre na Fotossíntese)
+  // Fórmula matemática de conversão inversa de o2 para co2 -> contrario da fotossintese
   float co2EstimadoPPM = 400.0 + (21.0 - leituraO2Final) * 10000.0;
   if (co2EstimadoPPM < 0) co2EstimadoPPM = 400.0;
 
-  Serial.print("-> Oxigénio Atmosférico em Exibição: "); Serial.print(leituraO2Final, 2); Serial.println("%");
-  Serial.print("-> Dióxido de Carbono Calculado: "); Serial.print(co2EstimadoPPM, 0); Serial.println(" ppm");
+  // Mostra os valores iniciais lidos/calculados no monitor
+  Serial.print("-> Oxigénio Atmosférico Lido: "); 
+  Serial.print(leituraO2Final, 2); 
+  Serial.println("%");
+  Serial.print("-> Dióxido de Carbono Calculado: "); 
+  Serial.print(co2EstimadoPPM, 0); 
+  Serial.println(" ppm");
 
- 
- // lógica de controlo (como estava no relatório intemédio) com ciclos para demonstração
-  if (co2EstimadoPPM < 800) {
-    Serial.println("-> ALERTA TR1: CO2 < 800 ppm! Abrindo Válvula Solenoide (LED IN8 ON)...");
-    mcp.digitalWrite(PINO_EXP_VALV_CO2, LOW);  
-    delay(4000); // Reduzi para 4 segundos para exigir menos tempo de esforço do microcontrolador
-    mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); 
-    Serial.println("-> Injeção concluída. Válvula selada.");
+  // -----------------------------------------------------------------------
+  // Llógica do intervalo [800 - 1200] ppm 
+  // -----------------------------------------------------------------------
+  if (co2EstimadoPPM < 800) { 
+    contadorEstavel = 0; // Reset 
     
-    if (modoDemoAtivo) o2Simulado_Demo = 20.93; // Próximo ciclo vai para Estável (1100 ppm)
+    Serial.println("-> ALERTA: CO2 < 800 ppm! Abrindo Válvula Solenoide (LED IN8 ON)...");
+    mcp.digitalWrite(PINO_EXP_VALV_CO2, LOW);  // Abrir a válvula (Liga o LED do INT8)
+    delay(4000);                               // Injetar por 4 segundos
+    mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); // Fechar a válvula (Desliga o LED do INT8)
+    Serial.println("-> Injeção concluída. Válvula selada.");
+
+    if (modoDemoAtivo && passoDemo == 1) {
+      o2Simulado_Demo = 1000.0; // Configura o passo seguinte da demo (Ideal)
+      passoDemo = 2;
+    }
   } 
   else if (co2EstimadoPPM >= 1200) {
-    Serial.println("-> CRÍTICO: CO2 >= 1200 ppm. Garantindo válvula FECHADA (LED IN8 OFF).");
-    mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);
+    contadorEstavel = 0; // Reset 
     
-    if (modoDemoAtivo) o2Simulado_Demo = 20.97; 
-    // Isto vai dar exatamente 700 ppm. Um valor ligeiramente abaixo dos 800, 
-    // ativa o relé 
+    Serial.println("-> CRÍTICO: CO2 >= 1200 ppm. Garantindo válvula FECHADA (LED IN8 OFF).");
+    mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); // Trancar a válvula por segurança
+
+    if (modoDemoAtivo && passoDemo == 3) {
+      o2Simulado_Demo = 21.05; // Reiniciar o ciclo de demonstração
+      passoDemo = 1;
+    }
   } 
   else {
+    // nível estável (Entre 800 e 1200 ppm)
     Serial.println("-> Nível de CO2 estável na meta [800 - 1200] ppm. Válvula em repouso.");
-    mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);
+    mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); // Válvula fechada e segura
+
+    if (!modoDemoAtivo) {
+      contadorEstavel++;
+      Serial.print("   [Tentativas estáveis seguidas: "); 
+      Serial.print(contadorEstavel); 
+      Serial.println("/4]");
+      
     
-    if (modoDemoAtivo) o2Simulado_Demo = 20.89; 
-    // Isto vai dar exatamente 1500 ppm. O suficiente para testar o valor crítico sem esforço em demasia
-  }}
+      if (contadorEstavel >= 4) {
+        modoDemoAtivo = true;
+        o2Simulado_Demo = 21.05; 
+        passoDemo = 1;
+        
+        // Força IMEDIATAMENTE a abertura do relé na quarta tentativa
+        Serial.println("\n-> [GATILHO DE SEGURANÇA]: Limite de estabilidade atingido!");
+        Serial.println("-> ALERTA(FORÇADO): Força-se CO2 a ser 0 ppm para demonstrar atuador...");
+        Serial.println("-> ALERTA: CO2 < 800 ppm! A abrir a Válvula Solenoide (LED IN8 ON)...");
+        
+        mcp.digitalWrite(PINO_EXP_VALV_CO2, LOW);  
+        delay(4000);                               // Mantém ativo por 4 segundos
+        mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); // Desliga
+        
+        Serial.println("-> Injeção concluída. Válvula selada.");
+        
+        // Prepara o passo 2 para a leitura seguinte
+        o2Simulado_Demo = 1000.0; 
+        passoDemo = 2;
+      }
+    } else {
+      // Se já estiver em modo demo e passou pelo estado ideal, força-se o crítico a seguir
+      if (passoDemo == 2) {
+        o2Simulado_Demo = 20.89; // Próximo ciclo força valor crítico (1500 ppm)
+        passoDemo = 3;
+      }
+    }
+  }
+
+  delay(3000); // Intervalo de 3 segundos
+}
