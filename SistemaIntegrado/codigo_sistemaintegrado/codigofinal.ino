@@ -12,13 +12,14 @@ Adafruit_MCP23X17 mcp;
 Adafruit_BME280 bme; 
 BH1750 lightMeter; 
 DFRobot_OxygenSensor oxygen;
+#define ENDERECO_I2C_O2 0x70
 
 // Pinos Diretos no TTGO
 #define PH_PIN 35      // Sonda de pH 
 #define SOLO_PIN 34    // Sensor de humidade do solo
 const int PINO_MOSFET = 25; // Controlo da bomba de rega via MOSFET 
 
-// Mapeamento de Pinos no Expansor MCP23017 
+// Mapeamento dos Pinos do Expansor MCP23017 
 const int PINO_EXP_VENTILACAO = 0; // IN1 -> Ventoinha
 const int PINO_EXP_ILUMINACAO = 3; // IN4 -> LEDs de Iluminação 
 const int PINO_EXP_ACIDO      = 4; // IN5 -> Bomba Peristáltica Ácido 
@@ -82,9 +83,11 @@ int contadorCongeladoPH = 0;
 bool modoDemoPHAtivo = false;
 
 // Subsistema 5: Atmosfera (CO2 / O2)
-float o2Simulado_Demo = 21.02;             
-bool sensorO2Operacional = false;    // Variável para saber se o sensor real está vivo            
 
+float o2Simulado_Demo = 21.05;             
+bool sensorO2Operacional = false;    
+bool valvulaAtiva = false;
+unsigned long tempoInicioValvula = 0;
 // -------------------------------------------------------------------------
 // Setup
 // -------------------------------------------------------------------------
@@ -99,7 +102,10 @@ void setup() {
 
   // Inicializar o barramento I2C partilhado nos pinos da TTGO
   Wire.begin(21, 22);
-  delay(500); 
+  Wire.setTimeOut(25); // Se trancar por mais de 25ms, liberta o bus i2c
+
+  
+  delay(500);
 
   // Inicializar Expansor MCP23017 (0x20)
   if (!mcp.begin_I2C(0x20)) {
@@ -122,9 +128,9 @@ void setup() {
   }
 
   //  Inicializar Sensor Oxigénio
-  if (oxygen.begin(OXYGEN_I2C_ADDRESS)) {
+  if (oxygen.begin(ENDERECO_I2C_O2)) {
     Serial.println("--- Sensor de Oxigénio detetado e Operacional ---");
-    sensorO2Operacional = true;  // Usa o hardware real!
+    sensorO2Operacional = true;  // Usa o hardware real
   } else {
     Serial.println("!!! AVISO: Sensor de O2 ausente. Modo Simulação Ativado!");
     sensorO2Operacional = false; // Fallback automático -> passa logo para a demonstração
@@ -144,7 +150,7 @@ void setup() {
 
   tempoTransicaoLuz = millis(); 
   // desfasamento no arranque (Evita choque de carga inicial)
-tempoTransicaoLuz = millis(); 
+  tempoTransicaoLuz = millis(); 
   // Desfasamento no arranque mais espaçado
   ultimoTempoClima      = millis() + 1000;   // 1 segundo após ligar
   ultimoTempoLuz        = millis() + 3000;   // 3 segundos após ligar
@@ -162,7 +168,7 @@ tempoTransicaoLuz = millis();
 void loop() {
   tempoAtual = millis(); 
 
-  // -----------------------------------------------------------------------
+ // -----------------------------------------------------------------------
   // SUBSISTEMA 1: Regulação Térmica e Clima (BME280)
   // -----------------------------------------------------------------------
   if (tempoAtual - ultimoTempoClima >= INTERVALO_CLIMA && !regaEmCurso) {
@@ -172,14 +178,23 @@ void loop() {
     float temp = bme.readTemperature(); 
     float hum  = bme.readHumidity(); 
     
-    Serial.print("-> Temp: "); Serial.print(temp, 1); Serial.print(" C | Hum: "); Serial.print(hum, 1); Serial.println(" %"); 
+    // Filtro de segurança: Se o sensor der um valor absurdo ou estiver desconectado
+    if (temp > 150.0 || temp < -40.0 || isnan(temp)) {
+      Serial.println("-> [AVISO DE HARDWARE]: BME280 a dar leitura falsa! Ignorar atuadores para evitar curto-circuito.");
+    } else {
+      Serial.print("-> Temp: "); 
+      Serial.print(temp, 1); 
+      Serial.print(" C | Hum: "); 
+      Serial.print(hum, 1); 
+      Serial.println(" %"); 
 
-    if (temp > 22 || hum > 70) {
-      Serial.println("-> ALERTA: Limites excedidos! Ativando Ventoinha (IN1)..."); 
-      mcp.digitalWrite(PINO_EXP_VENTILACAO, LOW); // Ativa por nível baixo
-    } else if (temp < 18 && hum < 50) { 
-      Serial.println("-> Clima OK. Desligando Ventoinha."); 
-      mcp.digitalWrite(PINO_EXP_VENTILACAO, HIGH); 
+      if (temp > LIMITE_TEMP_ALTA || hum > LIMITE_HUM_ALTA) {
+        Serial.println("-> ALERTA: Limites excedidos! Ativando Ventoinha (IN1)..."); 
+        mcp.digitalWrite(PINO_EXP_VENTILACAO, LOW); 
+      } else if (temp < LIMITE_TEMP_OK && hum < LIMITE_HUM_OK) { 
+        Serial.println("-> Clima OK. Desligando Ventoinha."); 
+        mcp.digitalWrite(PINO_EXP_VENTILACAO, HIGH); 
+      }
     }
   }
 
@@ -276,7 +291,6 @@ void loop() {
       Serial.println("-> Fluxo de irrigação concluído. A regressar à monitorização.");
     }
   }
-
  
  // -----------------------------------------------------------------------
   // SUBSISTEMA 4: Controlo do pH (MODO DEMONSTRAÇÃO DIRETAMENTE)
@@ -317,7 +331,7 @@ void loop() {
       else if (phSimulado_Demo < 5.5) {
         Serial.println("-> ALERTA: pH Baixo! Ativar Bomba Peristáltica de Base (IN6)..."); 
         mcp.digitalWrite(PINO_EXP_BASE, LOW);  
-        delay(2000);                                   
+        delay(100);                                   
         mcp.digitalWrite(PINO_EXP_BASE, HIGH); 
         phSimulado_Demo += 0.4; 
       } 
@@ -326,7 +340,7 @@ void loop() {
         phSimulado_Demo = 8.2; 
       }
     } 
-    // SE O SENSOR REAL ESTIVER VIVO E A MEXER NA ÁGUA
+    // se o sensor real estiver alive e mexer na água
     else {
       float voltagemPH = leituraPHReal * (3.3 / 4095.0); 
       float valorPHReal = 7.0 + (VOLTAGEM_PH7 - voltagemPH) * DECLIVE_PH; 
@@ -353,55 +367,48 @@ void loop() {
       }
     }
   }
-// -----------------------------------------------------------------------
-  // SUBSISTEMA 5: Atmosfera/CO2/O2 (MODO DEMONSTRAÇÃO DIRETAMENTE)
   // -----------------------------------------------------------------------
-  if (tempoAtual - ultimoTempoAtmosfera >= INTERVALO_ATMOSFERA && !regaEmCurso) {
+  // SUBSISTEMA 5: Atmosfera/CO2/O2
+  // -----------------------------------------------------------------------
+  if (tempoAtual - ultimoTempoAtmosfera >= INTERVALO_ATMOSFERA && !regaEmCurso && !valvulaAtiva) {
     ultimoTempoAtmosfera = tempoAtual;
-    Serial.println("\n[SUBSISTEMA 5 - ATMOSFERA E INJEÇÃO CO2]");
+    Serial.println("\n[SUBSISTEMA 5 - ATMOSFERA E GESTÃO DE CO2]");
     
-    float o2Lido = 0.0;
-
-    // tenta o real, se não der, simula
-    if (sensorO2Operacional) {
-      o2Lido = oxygen.getOxygenData(); // Lê a percentagem real do sensor DFRobot
-      Serial.print("-> [SINAL REAL] Oxigénio Lido no Sensor: "); 
-      Serial.print(o2Lido, 2); 
-      Serial.println("%");
-    } else {
-      o2Lido = o2Simulado_Demo;        // Usa a simulação para o código não crashar
-      Serial.print("-> [MODO CONTINGÊNCIA] Oxigénio Simulado: "); 
-      Serial.print(o2Lido, 2); 
-      Serial.println("%");
-    }
-
+    float o2Lido = sensorO2Operacional ? oxygen.getOxygenData(20) : o2Simulado_Demo;        
     float co2EstimadoPPM = 400.0 + (21.0 - o2Lido) * 10000.0;
     if (co2EstimadoPPM < 0) co2EstimadoPPM = 400.0;
 
-    Serial.print("-> Dióxido de Carbono Calculado: "); Serial.print(co2EstimadoPPM, 0); 
+    Serial.print("-> Dióxido de Carbono Calculado: "); 
+    Serial.print(co2EstimadoPPM, 0); 
     Serial.println(" ppm");
 
     if (co2EstimadoPPM < 800) {
-      Serial.println("-> ALERTA TR1: CO2 < 800 ppm! Abrir Válvula Solenoide por 4s...");
-      mcp.digitalWrite(PINO_EXP_VALV_CO2, LOW);  
-      delay(4000);                               
-      mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); 
-      Serial.println("-> Injeção de gás concluída. Válvula selada.");
+      Serial.println("-> ALERTA: CO2 abaixo da meta! Disparando Válvula Solenoide por 4s...");
+      mcp.digitalWrite(PINO_EXP_VALV_CO2, LOW);   // Abre válvula
+      valvulaAtiva = true;
+      tempoInicioValvula = tempoAtual;            // Regista o segundo em que abriu
       
-      // Se estiver em modo simulação, altera a variável para vermos a reação no próximo ciclo
       if (!sensorO2Operacional) o2Simulado_Demo = 20.93; 
     } 
     else if (co2EstimadoPPM >= 1200) {
-      Serial.println("-> CRÍTICO: CO2 >= 1200 ppm. Garantir válvula FECHADA (LED IN8 OFF).");
-      mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);
-      
-      if (!sensorO2Operacional) o2Simulado_Demo = 21.02; 
+      Serial.println("-> CRÍTICO: CO2 em excesso! Ativando Ventoinha de Extração (IN1)...");
+      mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);  
+      mcp.digitalWrite(PINO_EXP_VENTILACAO, LOW); 
+      if (!sensorO2Operacional) o2Simulado_Demo = 21.05; 
     } 
     else {
-      Serial.println("-> Nível de CO2 estável na meta [800 - 1200] ppm. Válvula em repouso.");
-      mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);
-      
-      if (!sensorO2Operacional) o2Simulado_Demo = 20.89; 
+      Serial.println("-> Nível de CO2 estável na meta [800 - 1200] ppm.");
+      mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);   
+      mcp.digitalWrite(PINO_EXP_VENTILACAO, HIGH); 
+      if (!sensorO2Operacional) o2Simulado_Demo = 20.85; 
     }
   }
-}
+
+  
+// Bloco de segurança temporizado (fim do subsistema 5)
+  if (valvulaAtiva && (tempoAtual - tempoInicioValvula >= 4000)) {
+    mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); 
+    valvulaAtiva = false;
+    Serial.println("-> [Sucesso]: Injeção temporizada de CO2 concluída. Válvula selada.");
+  }
+} 
