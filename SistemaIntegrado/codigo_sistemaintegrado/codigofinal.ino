@@ -5,410 +5,431 @@
 #include <BH1750.h>
 #include <DFRobot_OxygenSensor.h>
 
-// -------------------------------------------------------------------------
-// Configurações gerais e hardware
-// -------------------------------------------------------------------------
-Adafruit_MCP23X17 mcp; 
-Adafruit_BME280 bme; 
-BH1750 lightMeter; 
+Adafruit_MCP23X17 mcp;
+Adafruit_BME280 bme;
+BH1750 lightMeter;
 DFRobot_OxygenSensor oxygen;
-#define ENDERECO_I2C_O2 0x70
+#define ENDERECO_I2C_O2 0x73
 
-// Pinos Diretos no TTGO
-#define PH_PIN 35      // Sonda de pH 
-#define SOLO_PIN 34    // Sensor de humidade do solo
-const int PINO_MOSFET = 25; // Controlo da bomba de rega via MOSFET 
+#define PH_PIN 35
+#define SOLO_PIN 34
+const int PINO_MOSFET = 25;
 
-// Mapeamento dos Pinos do Expansor MCP23017 
-const int PINO_EXP_VENTILACAO = 0; // IN1 -> Ventoinha
-const int PINO_EXP_ILUMINACAO = 3; // IN4 -> LEDs de Iluminação 
-const int PINO_EXP_ACIDO      = 4; // IN5 -> Bomba Peristáltica Ácido 
-const int PINO_EXP_BASE       = 5; // IN6 -> Bomba Peristáltica Base 
-const int PINO_EXP_VALV_CO2   = 7; // IN8 -> Válvula Solenoide de CO2 
+const int PINO_EXP_VENTILACAO = 0;
+const int PINO_EXP_ILUMINACAO = 3;
+const int PINO_EXP_ACIDO      = 4;
+const int PINO_EXP_BASE       = 5;
+const int PINO_EXP_VALV_CO2   = 7;
 
-// -------------------------------------------------------------------------
-// Variáveis para controlar o tempo (TIME-SLICING)
-// -------------------------------------------------------------------------
-unsigned long tempoAtual = 0; 
-
-// Intervalos de execução de cada subsistema para evitar sobrecarga
-const unsigned long INTERVALO_CLIMA      = 5000;  // Clima verifica a cada 5s
-const unsigned long INTERVALO_LUZ        = 11000; // Luz monitoriza a cada 11s 
-const unsigned long INTERVALO_SOLO       = 17000; // Solo verifica a cada 17s
-const unsigned long INTERVALO_PH         = 23000; // pH analisa a cada 23s 
-const unsigned long INTERVALO_ATMOSFERA  = 29000; // CO2 verifica a cada 29s
-
-// Registos do último milissegundo em que cada subsistema rodou
-unsigned long ultimoTempoClima      = 0;
-unsigned long ultimoTempoLuz        = 0;
-unsigned long ultimoTempoSolo       = 0;
-unsigned long ultimoTempoPH         = 0;
-unsigned long ultimoTempoAtmosfera  = 0;
+#define SDA_PIN 21
+#define SCL_PIN 22
 
 // -------------------------------------------------------------------------
-// Variáveis específicas de cada subsistema
+// I2C RECOVERY - VERSÃO FINAL
 // -------------------------------------------------------------------------
-// Subsistema 1: Regulação Térmica e Circulação de Ar (BME280)
-const float LIMITE_TEMP_ALTA = 22.0;       // Limite para ativar ventoinha 
-const float LIMITE_HUM_ALTA  = 70.0;       // Limite da humidade do ar 
-const float LIMITE_TEMP_OK   = 18.0;       // Limite de conservação para desligar 
-const float LIMITE_HUM_OK    = 50.0;       // Humidade segura para desligar 
+bool falhaGeralI2C = false;
 
-// Subsistema 2: Iluminação e Fotoperíodo (BH1750)
-const float THRESHOLD_LUZ = 50.0;          
-const unsigned long DURACAO_DIA = 20000;   // 20s de simulação (depois seria passado para as 16horas do tempo real) -> a variável está em milissegundos
-const unsigned long DURACAO_NOITE = 10000; // 10s de simulação (depois troca-se para as 8horas do tempo real)
-unsigned long tempoTransicaoLuz = 0;
-bool eDia = true;                          
+void recuperarI2C() {
+  Serial.println("!!! [I2C RECOVERY] Barramento travado. A recuperar...");
+  Wire.end();
+  delay(10);
+  pinMode(SCL_PIN, OUTPUT);
+  pinMode(SDA_PIN, OUTPUT);
+  digitalWrite(SDA_PIN, HIGH);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(SCL_PIN, LOW);  delayMicroseconds(5);
+    digitalWrite(SCL_PIN, HIGH); delayMicroseconds(5);
+  }
+  digitalWrite(SDA_PIN, LOW);  delayMicroseconds(5);
+  digitalWrite(SCL_PIN, HIGH); delayMicroseconds(5);
+  digitalWrite(SDA_PIN, HIGH); delayMicroseconds(5);
 
-// Subsistema 3: Humidade do Solo (Irrigação)
-const int Valor_Seco = 2500;               
-const int Valor_Agua = 1600;               
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setTimeOut(25);
+  delay(100);
+
+  if (!mcp.begin_I2C(0x20)) {
+    Serial.println("!!! [RECOVERY] MCP23017 não respondeu.");
+  } else {
+    mcp.pinMode(PINO_EXP_VENTILACAO, OUTPUT); mcp.digitalWrite(PINO_EXP_VENTILACAO, HIGH);
+    mcp.pinMode(PINO_EXP_ILUMINACAO, OUTPUT); mcp.digitalWrite(PINO_EXP_ILUMINACAO, HIGH);
+    mcp.pinMode(PINO_EXP_ACIDO,      OUTPUT); mcp.digitalWrite(PINO_EXP_ACIDO,      HIGH);
+    mcp.pinMode(PINO_EXP_BASE,       OUTPUT); mcp.digitalWrite(PINO_EXP_BASE,       HIGH);
+    mcp.pinMode(PINO_EXP_VALV_CO2,   OUTPUT); mcp.digitalWrite(PINO_EXP_VALV_CO2,   HIGH);
+    Serial.println("-> [RECOVERY] MCP23017 recuperado.");
+  }
+  bme.begin(0x77);
+  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+  
+  falhaGeralI2C = false;
+  Serial.println("-> [RECOVERY] Concluído. A retomar operação normal.");
+}
+
+// -------------------------------------------------------------------------
+// TIME-SLICING
+// -------------------------------------------------------------------------
+unsigned long tempoAtual = 0;
+
+const unsigned long INTERVALO_CLIMA     = 5000;
+const unsigned long INTERVALO_LUZ       = 11000;
+const unsigned long INTERVALO_SOLO      = 17000;
+const unsigned long INTERVALO_PH        = 23000;
+const unsigned long INTERVALO_ATMOSFERA = 29000;
+
+unsigned long ultimoTempoClima     = 0;
+unsigned long ultimoTempoLuz       = 0;
+unsigned long ultimoTempoSolo      = 0;
+unsigned long ultimoTempoPH        = 0;
+unsigned long ultimoTempoAtmosfera = 0;
+
+// -------------------------------------------------------------------------
+// SUBSISTEMA 1
+// -------------------------------------------------------------------------
+const float LIMITE_TEMP_ALTA = 22.0;
+const float LIMITE_HUM_ALTA  = 70.0;
+const float LIMITE_TEMP_OK   = 20.0;
+const float LIMITE_HUM_OK    = 60.0;
+bool ventoinhaAtiva = false;
+
+// -------------------------------------------------------------------------
+// SUBSISTEMA 2
+// -------------------------------------------------------------------------
+const float THRESHOLD_LUZ         = 50.0;
+const unsigned long DURACAO_DIA   = 20000;
+const unsigned long DURACAO_NOITE = 10000;
+unsigned long tempoTransicaoLuz   = 0;
+bool eDia = true;
+
+// -------------------------------------------------------------------------
+// SUBSISTEMA 3
+// -------------------------------------------------------------------------
+const int Valor_Seco = 2500;
+const int Valor_Agua = 1600;
 bool regaEmCurso = false;
 unsigned long tempoInicioRega = 0;
-const unsigned long TEMPO_REGA = 4000;     // Reduzido para 4s para prevenir contra os resets elétricos
-// estas variáveis do subsistema "de humidade servem para detetar se o sensor "congelou"
-int leituraSoloAnterior = -1; //valor negativo porque o sensor analógico nunca devolve valor negativo assim leituraSoloReal nunca será ==-1 (leituraSoloAnterior)
+const unsigned long TEMPO_REGA = 4000;
+int leituraSoloAnterior   = -1;
 int contadorCongeladoSolo = 0;
-bool modoDemoSoloAtivo = false;  
+bool modoDemoSoloAtivo    = false;
 int humidadeSimulada_Demo = 55;
 
-// Subsistema 4: Controlo de pH (Nutrientes)
-const float VOLTAGEM_PH7 = 1.61;           
-const float DECLIVE_PH = 5.66;             
-float phSimulado_Demo = 8.2;               
-// variáveis do subsistema de pH servem para detetar se o sensor "congelou"
-int leituraPHAnterior = -1;
-int contadorCongeladoPH = 0;
-bool modoDemoPHAtivo = false;
+// -------------------------------------------------------------------------
+// SUBSISTEMA 4
+// -------------------------------------------------------------------------
+const float VOLTAGEM_PH7 = 1.61;
+const float DECLIVE_PH   = 5.66;
+float phSimulado_Demo    = 8.2;
+int leituraPHAnterior    = -1;
+int contadorCongeladoPH  = 0;
+bool modoDemoPHAtivo     = false;
 
-// Subsistema 5: Atmosfera (CO2 / O2)
+bool bombaAcidoAtiva = false;
+bool bombaBaseAtiva  = false;
+unsigned long tempoInicioBombaAcido = 0;
+unsigned long tempoInicioBombaBase  = 0;
+const unsigned long TEMPO_BOMBA_PH  = 2000;
 
-float o2Simulado_Demo = 21.05;             
-bool sensorO2Operacional = false;    
-bool valvulaAtiva = false;
+// -------------------------------------------------------------------------
+// SUBSISTEMA 5
+// -------------------------------------------------------------------------
+float o2Simulado_Demo    = 21.05;
+bool sensorO2Operacional = false;
+bool valvulaAtiva        = false;
 unsigned long tempoInicioValvula = 0;
+
 // -------------------------------------------------------------------------
 // Setup
 // -------------------------------------------------------------------------
 void setup() {
-  Serial.begin(115200); 
-  analogReadResolution(12); // ESP32 a 12 bits (0-4095) 
-  
-  pinMode(PH_PIN, INPUT); 
-  pinMode(SOLO_PIN, INPUT); 
+  Serial.begin(115200);
+  analogReadResolution(12);
+
+  pinMode(PH_PIN, INPUT);
+  pinMode(SOLO_PIN, INPUT);
   pinMode(PINO_MOSFET, OUTPUT);
-  digitalWrite(PINO_MOSFET, LOW); // Garante que a bomba de rega está off 
+  digitalWrite(PINO_MOSFET, LOW);
 
-  // Inicializar o barramento I2C partilhado nos pinos da TTGO
-  Wire.begin(21, 22);
-  Wire.setTimeOut(25); // Se trancar por mais de 25ms, liberta o bus i2c
-
-  
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setTimeOut(25);
   delay(500);
 
-  // Inicializar Expansor MCP23017 (0x20)
-  if (!mcp.begin_I2C(0x20)) {
-    Serial.println("ERRO CRÍTICO: MCP23017 não encontrado!"); 
-    while (1); 
+  if (!mcp.begin_I2C(0x20)) { Serial.println("ERRO: MCP23017!"); while (1); }
+  if (!bme.begin(0x77))     { Serial.println("ERRO: BME280!");   while (1); }
+  if (!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
+    Serial.println("ERRO: BH1750!"); while (1);
   }
-
-  // Inicializar Sensor Clima BME280 (0x77)
-  if (!bme.begin(0x77)) { 
-    Serial.println("Erro crítico: BME280 não encontrado!"); 
-    while (1); 
-  }
-
-  // Inicializar Sensor Luminosidade BH1750
-  if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
-    Serial.println("--- BH1750 configurado com sucesso ---"); 
-  } else {
-    Serial.println("ERRO CRÍTICO: BH1750 não encontrado!");
-    while (1); 
-  }
-
-  //  Inicializar Sensor Oxigénio
   if (oxygen.begin(ENDERECO_I2C_O2)) {
-    Serial.println("--- Sensor de Oxigénio detetado e Operacional ---");
-    sensorO2Operacional = true;  // Usa o hardware real
+    Serial.println("--- Sensor O2 Operacional ---");
+    sensorO2Operacional = true;
   } else {
-    Serial.println("!!! AVISO: Sensor de O2 ausente. Modo Simulação Ativado!");
-    sensorO2Operacional = false; // Fallback automático -> passa logo para a demonstração
+    Serial.println("!!! Sensor O2 ausente. Modo Simulação.");
+    sensorO2Operacional = false;
   }
 
-  // Configurei as saídas do Expansor e forcei o estado OFF por segurança (HIGH)
   mcp.pinMode(PINO_EXP_VENTILACAO, OUTPUT); 
-  mcp.digitalWrite(PINO_EXP_VENTILACAO, HIGH); 
+  mcp.digitalWrite(PINO_EXP_VENTILACAO, HIGH);
   mcp.pinMode(PINO_EXP_ILUMINACAO, OUTPUT); 
-  mcp.digitalWrite(PINO_EXP_ILUMINACAO, HIGH); 
-  mcp.pinMode(PINO_EXP_ACIDO, OUTPUT);      
-  mcp.digitalWrite(PINO_EXP_ACIDO, HIGH); 
-  mcp.pinMode(PINO_EXP_BASE, OUTPUT);       
-  mcp.digitalWrite(PINO_EXP_BASE, HIGH); 
-  mcp.pinMode(PINO_EXP_VALV_CO2, OUTPUT);   
-  mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); 
+  mcp.digitalWrite(PINO_EXP_ILUMINACAO, HIGH);
+  mcp.pinMode(PINO_EXP_ACIDO,      OUTPUT); 
+  mcp.digitalWrite(PINO_EXP_ACIDO,      HIGH);
+  mcp.pinMode(PINO_EXP_BASE,       OUTPUT); 
+  mcp.digitalWrite(PINO_EXP_BASE,       HIGH);
+  mcp.pinMode(PINO_EXP_VALV_CO2,   OUTPUT); 
+  mcp.digitalWrite(PINO_EXP_VALV_CO2,   HIGH);
 
-  tempoTransicaoLuz = millis(); 
-  // desfasamento no arranque (Evita choque de carga inicial)
-  tempoTransicaoLuz = millis(); 
-  // Desfasamento no arranque mais espaçado
-  ultimoTempoClima      = millis() + 1000;   // 1 segundo após ligar
-  ultimoTempoLuz        = millis() + 3000;   // 3 segundos após ligar
-  ultimoTempoSolo       = millis() + 5000;   // 5 segundos após ligar
-  ultimoTempoPH         = millis() + 7000;   // 7 segundos após ligar
-  ultimoTempoAtmosfera  = millis() + 9000;   // 9 segundos após ligar
+  tempoTransicaoLuz    = millis();
+  ultimoTempoClima     = millis() + 1000;
+  ultimoTempoLuz       = millis() + 3000;
+  ultimoTempoSolo      = millis() + 5000;
+  ultimoTempoPH        = millis() + 7000;
+  ultimoTempoAtmosfera = millis() + 9000;
+
   Serial.println("\n__________________________________________________________");
-  Serial.println("--- Sistema Integrado---");
+  Serial.println("--- Sistema Integrado (v3 - I2C Recovery sem Watchdog) ---");
   Serial.println("__________________________________________________________");
 }
 
-// ------------------------------------------------
+// -------------------------------------------------------------------------
 // Loop Principal
-// ------------------------------------------------
+// -------------------------------------------------------------------------
 void loop() {
-  tempoAtual = millis(); 
+  tempoAtual = millis();
 
- // -----------------------------------------------------------------------
-  // SUBSISTEMA 1: Regulação Térmica e Clima (BME280)
+  if (falhaGeralI2C) {
+      recuperarI2C();
+  }
+
+  // Desactivacao temporizada das bombas de pH e CO2
+  if (bombaAcidoAtiva && (tempoAtual - tempoInicioBombaAcido >= TEMPO_BOMBA_PH)) {
+    mcp.digitalWrite(PINO_EXP_ACIDO, HIGH);
+    bombaAcidoAtiva = false;
+    Serial.println("-> [pH] Bomba de Ácido desligada.");
+  }
+  if (bombaBaseAtiva && (tempoAtual - tempoInicioBombaBase >= TEMPO_BOMBA_PH)) {
+    mcp.digitalWrite(PINO_EXP_BASE, HIGH);
+    bombaBaseAtiva = false;
+    Serial.println("-> [pH] Bomba de Base desligada.");
+  }
+  if (valvulaAtiva && (tempoAtual - tempoInicioValvula >= 4000)) {
+    mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);
+    valvulaAtiva = false;
+    Serial.println("-> [CO2] Válvula selada.");
+  }
+
+  // -----------------------------------------------------------------------
+  // SUBSISTEMA 1: Térmico
   // -----------------------------------------------------------------------
   if (tempoAtual - ultimoTempoClima >= INTERVALO_CLIMA && !regaEmCurso) {
     ultimoTempoClima = tempoAtual;
     Serial.println("\n[SUBSISTEMA 1 - TÉRMICO & CIRCULAÇÃO]");
+
+    float temp = bme.readTemperature();
+    float hum  = bme.readHumidity();
     
-    float temp = bme.readTemperature(); 
-    float hum  = bme.readHumidity(); 
-    
-    // Filtro de segurança: Se o sensor der um valor absurdo ou estiver desconectado
+    if (isnan(temp)) falhaGeralI2C = true;
+
     if (temp > 150.0 || temp < -40.0 || isnan(temp)) {
-      Serial.println("-> [AVISO DE HARDWARE]: BME280 a dar leitura falsa! Ignorar atuadores para evitar curto-circuito.");
+      Serial.println("-> [AVISO]: BME280 com leitura inválida.");
     } else {
       Serial.print("-> Temp: "); 
-      Serial.print(temp, 1); 
+      Serial.print(temp, 1);
       Serial.print(" C | Hum: "); 
       Serial.print(hum, 1); 
-      Serial.println(" %"); 
+      Serial.println(" %");
 
-      if (temp > LIMITE_TEMP_ALTA || hum > LIMITE_HUM_ALTA) {
-        Serial.println("-> ALERTA: Limites excedidos! Ativando Ventoinha (IN1)..."); 
-        mcp.digitalWrite(PINO_EXP_VENTILACAO, LOW); 
-      } else if (temp < LIMITE_TEMP_OK && hum < LIMITE_HUM_OK) { 
-        Serial.println("-> Clima OK. Desligando Ventoinha."); 
-        mcp.digitalWrite(PINO_EXP_VENTILACAO, HIGH); 
+      if (!ventoinhaAtiva && (temp > LIMITE_TEMP_ALTA || hum > LIMITE_HUM_ALTA)) {
+        Serial.println("-> ALERTA: Limites excedidos! A ativar a ventoinha...");
+        mcp.digitalWrite(PINO_EXP_VENTILACAO, LOW);
+        ventoinhaAtiva = true;
+      } else if (ventoinhaAtiva && temp < LIMITE_TEMP_OK && hum < LIMITE_HUM_OK) {
+        Serial.println("-> Clima normalizado. A desligar a ventoinha.");
+        mcp.digitalWrite(PINO_EXP_VENTILACAO, HIGH);
+        ventoinhaAtiva = false;
+      } else if (ventoinhaAtiva) {
+        Serial.println("-> Ventoinha ativa (aguardar normalização).");
+      } else {
+        Serial.println("-> Clima OK.");
       }
     }
   }
 
   // -----------------------------------------------------------------------
-  // SUBSISTEMA 2: Fotoperíodo e Iluminação (BH1750)
+  // SUBSISTEMA 2: Fotoperíodo
   // -----------------------------------------------------------------------
   if (tempoAtual - ultimoTempoLuz >= INTERVALO_LUZ) {
     ultimoTempoLuz = tempoAtual;
     Serial.println("\n[SUBSISTEMA 2 - ILUMINAÇÃO]");
-    
-    float lux = lightMeter.readLightLevel(); 
 
-    if (eDia) { 
-      mcp.digitalWrite(PINO_EXP_ILUMINACAO, LOW); // LEDs ON 
-      Serial.print("-> [Janela Ativa - DIA] Luminosidade: "); 
-      Serial.print(lux, 1); 
+    float lux = lightMeter.readLightLevel();
+
+    if (eDia) {
+      mcp.digitalWrite(PINO_EXP_ILUMINACAO, LOW);
+      Serial.print("-> [DIA] Luminosidade: "); 
+      Serial.print(lux, 1); ~
       Serial.println(" lx");
-
-      if (lux < THRESHOLD_LUZ) { 
-        Serial.println("!!! ALERTA DE HARDWARE: LEDs em falha ou sem potência !!!"); 
-      }
-      if (tempoAtual - tempoTransicaoLuz >= DURACAO_DIA) { 
-        Serial.println("-> Transição Horária: Iniciando Janela de Descanso (NOITE)...");
-        eDia = false; 
-        tempoTransicaoLuz = tempoAtual;
+      if (lux < THRESHOLD_LUZ) Serial.println("!!! ALERTA: LEDs em falha !!!");
+      if (tempoAtual - tempoTransicaoLuz >= DURACAO_DIA) {
+        Serial.println("-> Transição: NOITE...");
+        eDia = false; tempoTransicaoLuz = tempoAtual;
       }
     } else {
-      mcp.digitalWrite(PINO_EXP_ILUMINACAO, HIGH); // LEDs OFF 
-      Serial.print("-> [JANELA DESCANSO - NOITE] Luminosidade: ");
+      mcp.digitalWrite(PINO_EXP_ILUMINACAO, HIGH);
+      Serial.print("-> [NOITE] Luminosidade: "); 
       Serial.print(lux, 1); 
-      Serial.println(" lx"); 
-
+      Serial.println(" lx");
       if (tempoAtual - tempoTransicaoLuz >= DURACAO_NOITE) {
-        Serial.println("-> Transição Horária: Iniciando Janela Activa (DIA)..."); 
-        eDia = true; 
-        tempoTransicaoLuz = tempoAtual;
+        Serial.println("-> Transição: DIA...");
+        eDia = true; tempoTransicaoLuz = tempoAtual;
       }
     }
   }
 
   // -----------------------------------------------------------------------
-  // SUBSISTEMA 3: Irrigação do Solo (SENSOR CAPACITIVO e MOSFET)
+  // SUBSISTEMA 3: Solo
   // -----------------------------------------------------------------------
- if (!regaEmCurso) {
+  if (!regaEmCurso) {
     if (tempoAtual - ultimoTempoSolo >= INTERVALO_SOLO) {
       ultimoTempoSolo = tempoAtual;
       Serial.println("\n[SUBSISTEMA 3 - HUMIDADE DO SOLO]");
-      
-      int leituraSoloReal = analogRead(SOLO_PIN); 
-      // Lógica de Congelamento: 3 leituras idênticas (ciclos seguidos) ativam a Demonstração
+
+      int leituraSoloReal = analogRead(SOLO_PIN);
       if (leituraSoloReal == leituraSoloAnterior) {
         contadorCongeladoSolo++;
-        if (contadorCongeladoSolo >= 3) { 
-          modoDemoSoloAtivo = true;
-        }
+        if (contadorCongeladoSolo >= 3) modoDemoSoloAtivo = true;
       } else {
-        contadorCongeladoSolo = 0;
-        modoDemoSoloAtivo = false;
+        contadorCongeladoSolo = 0; modoDemoSoloAtivo = false;
         leituraSoloAnterior = leituraSoloReal;
       }
 
       int humidadeSolo = 0;
-
       if (!modoDemoSoloAtivo) {
         humidadeSolo = map(leituraSoloReal, Valor_Seco, Valor_Agua, 0, 100);
-        humidadeSolo = constrain(humidadeSolo, 0, 100); 
-        Serial.print("-> [Sinal Real] Solo Humidade: "); 
-        Serial.print(humidadeSolo); 
-        Serial.println("%");
+        humidadeSolo = constrain(humidadeSolo, 0, 100);
+        Serial.print("-> [Real] Humidade: "); Serial.print(humidadeSolo); Serial.println("%");
       } else {
         humidadeSolo = humidadeSimulada_Demo;
-        Serial.print("-> [Sensor Congelado - MODO DEMONSTRAÇÃO ATIVO] Solo Humidade Simulada: "); 
-        Serial.print(humidadeSolo);
-        Serial.println("%");
+        Serial.print("-> [DEMO] Humidade: "); Serial.print(humidadeSolo); Serial.println("%");
       }
 
-      if (humidadeSolo < 40) { 
-        Serial.println("-> ALERTA: Solo Seco! Disparar Bomba Submersível via MOSFET..."); 
-        digitalWrite(PINO_MOSFET, HIGH); 
-        regaEmCurso = true;
-        tempoInicioRega = tempoAtual;
-        if (modoDemoSoloAtivo) humidadeSimulada_Demo = 75; // Recupera humidade na demonstração
+      // Alterei aqui: Forcei a rega se a humidade for < 40 ou se o sensor estiver congelado (>= 3 significa 4 leituras iguais)
+      if (humidadeSolo < 40 || contadorCongeladoSolo >= 3) {
+        if (contadorCongeladoSolo >= 3) {
+          Serial.println("-> ALERTA: Sensor congelado (4 leituras iguais)! Forçando Bomba...");
+        } else {
+          Serial.println("-> Solo Seco! Ativando Bomba...");
+        }
+        digitalWrite(PINO_MOSFET, HIGH);
+        regaEmCurso = true; tempoInicioRega = tempoAtual;
+        if (modoDemoSoloAtivo) humidadeSimulada_Demo = 75;
+        
+        // Zera o contador para não ficar num ciclo infinito forçado
+        contadorCongeladoSolo = 0; 
       } else if (humidadeSolo >= 70) {
         digitalWrite(PINO_MOSFET, LOW);
-        if (modoDemoSoloAtivo) humidadeSimulada_Demo = 35; // Seca no próximo ciclo de demonstração
+        if (modoDemoSoloAtivo) humidadeSimulada_Demo = 35;
       }
     }
   } else {
-    // Gestão do tempo de rega para não parar a placa
     if (tempoAtual - tempoInicioRega >= TEMPO_REGA) {
-      digitalWrite(PINO_MOSFET, LOW); // Desligar a bomba após o tempo de rega 
+      digitalWrite(PINO_MOSFET, LOW);
       regaEmCurso = false;
-      ultimoTempoSolo = tempoAtual; // Adicionar margem para a próxima leitura
-      Serial.println("-> Fluxo de irrigação concluído. A regressar à monitorização.");
+      leituraSoloAnterior = -1;
+      contadorCongeladoSolo = 0;
+      ultimoTempoSolo = tempoAtual;
+      Serial.println("-> Irrigação concluída.");
     }
   }
- 
- // -----------------------------------------------------------------------
-  // SUBSISTEMA 4: Controlo do pH (MODO DEMONSTRAÇÃO DIRETAMENTE)
+
   // -----------------------------------------------------------------------
-  if (tempoAtual - ultimoTempoPH >= INTERVALO_PH && !regaEmCurso) {
+  // SUBSISTEMA 4: pH
+  // -----------------------------------------------------------------------
+  if (tempoAtual - ultimoTempoPH >= INTERVALO_PH && !regaEmCurso
+      && !bombaAcidoAtiva && !bombaBaseAtiva) {
     ultimoTempoPH = tempoAtual;
     Serial.println("\n[SUBSISTEMA 4 - ESTABILIZAÇÃO DE pH]");
-    
-    // Deixar a leitura física aqui para o caso de o "else" seja ativado
-    int leituraPHReal = 0; 
-    for(int i=0; i<10; i++) { leituraPHReal += analogRead(PH_PIN); delay(10); } 
+
+    int leituraPHReal = 0;
+    for (int i = 0; i < 10; i++) { leituraPHReal += analogRead(PH_PIN); delay(10); }
     leituraPHReal /= 10;
 
-    // Lógica de Congelamento: Verifica se o valor analógico não mexe nada
     if (leituraPHReal == leituraPHAnterior) {
       contadorCongeladoPH++;
-      if (contadorCongeladoPH >= 3) { 
-        modoDemoPHAtivo = true;
-      }
+      if (contadorCongeladoPH >= 3) modoDemoPHAtivo = true;
     } else {
-      contadorCongeladoPH = 0;
-      modoDemoPHAtivo = false;
+      contadorCongeladoPH = 0; modoDemoPHAtivo = false;
       leituraPHAnterior = leituraPHReal;
     }
 
-    // Se o sensor estiver congelado, corre a simulação para ver o atuador a dar
-    if (modoDemoPHAtivo) { 
-      Serial.print("-> [CONGELADO - MODO DEMONSTRAÇÃO ATIVO] pH Simulado para Demonstração: "); 
-      Serial.println(phSimulado_Demo, 2);
-
-      if (phSimulado_Demo > 6.5) { 
-        Serial.println("-> ALERTA: pH Alto! Ativar Bomba Peristáltica de Ácido (IN5)..."); 
-        mcp.digitalWrite(PINO_EXP_ACIDO, LOW); 
-        delay(2000);                                   
-        mcp.digitalWrite(PINO_EXP_ACIDO, HIGH); 
-        phSimulado_Demo -= 0.5; 
-      } 
-      else if (phSimulado_Demo < 5.5) {
-        Serial.println("-> ALERTA: pH Baixo! Ativar Bomba Peristáltica de Base (IN6)..."); 
-        mcp.digitalWrite(PINO_EXP_BASE, LOW);  
-        delay(100);                                   
-        mcp.digitalWrite(PINO_EXP_BASE, HIGH); 
-        phSimulado_Demo += 0.4; 
-      } 
-      else {
-        Serial.println("-> pH quimicamente estabilizado em 6.0 (Ideal). Bombas em repouso."); 
-        phSimulado_Demo = 8.2; 
-      }
-    } 
-    // se o sensor real estiver alive e mexer na água
-    else {
-      float voltagemPH = leituraPHReal * (3.3 / 4095.0); 
-      float valorPHReal = 7.0 + (VOLTAGEM_PH7 - voltagemPH) * DECLIVE_PH; 
-      valorPHReal = constrain(valorPHReal, 0.0, 14.0); 
-
-      Serial.print("-> [Sinal Real]     Tensão: "); 
-      Serial.print(voltagemPH); 
-      Serial.print("V | pH Real Calculado: "); 
-      Serial.println(valorPHReal, 2); 
-      
-      if (valorPHReal > 6.5) { 
-        Serial.println("-> ALERTA REAL: pH Alto detetado na sonda. Dosear Ácido por 2s...");
-        mcp.digitalWrite(PINO_EXP_ACIDO, LOW); 
-        delay(2000); 
-        mcp.digitalWrite(PINO_EXP_ACIDO, HIGH); 
-
-      } else if (valorPHReal < 5.5) { 
-        Serial.println("-> ALERTA REAL: pH Baixo detetado na sonda. Dosear Base por 2s...");
-        mcp.digitalWrite(PINO_EXP_BASE, LOW); 
-        delay(2000); 
-        mcp.digitalWrite(PINO_EXP_BASE, HIGH); 
+    if (modoDemoPHAtivo) {
+      Serial.print("-> [DEMO] pH: "); Serial.println(phSimulado_Demo, 2);
+      if (phSimulado_Demo > 6.5) {
+        Serial.println("-> pH Alto! Ativar Ácido 2s...");
+        mcp.digitalWrite(PINO_EXP_ACIDO, LOW);
+        bombaAcidoAtiva = true; tempoInicioBombaAcido = tempoAtual;
+        phSimulado_Demo -= 0.5;
+      } else if (phSimulado_Demo < 5.5) {
+        Serial.println("-> pH Baixo! Ativar Base 2s...");
+        mcp.digitalWrite(PINO_EXP_BASE, LOW);
+        bombaBaseAtiva = true; tempoInicioBombaBase = tempoAtual;
+        phSimulado_Demo += 0.4;
       } else {
-        Serial.println("-> pH Real estável na faixa segura. Atuadores em repouso.");
+        Serial.println("-> pH estabilizado. Bombas em repouso.");
+        phSimulado_Demo = 8.2;
+      }
+    } else {
+      float voltagemPH  = leituraPHReal * (3.3 / 4095.0);
+      float valorPHReal = 7.0 + (VOLTAGEM_PH7 - voltagemPH) * DECLIVE_PH;
+      valorPHReal = constrain(valorPHReal, 0.0, 14.0);
+      Serial.print("-> [Real] "); 
+      Serial.print(voltagemPH); 
+      Serial.print("V | pH: ");
+      Serial.println(valorPHReal, 2);
+
+      if (valorPHReal > 6.5) {
+        Serial.println("-> pH Alto. Dosear Ácido 2s...");
+        mcp.digitalWrite(PINO_EXP_ACIDO, LOW);
+        bombaAcidoAtiva = true; tempoInicioBombaAcido = tempoAtual;
+      } else if (valorPHReal < 5.5) {
+        Serial.println("-> pH Baixo. Dosear Base 2s...");
+        mcp.digitalWrite(PINO_EXP_BASE, LOW);
+        bombaBaseAtiva = true; 
+        tempoInicioBombaBase = tempoAtual;
+      } else {
+        Serial.println("-> pH estável.");
       }
     }
   }
+
   // -----------------------------------------------------------------------
-  // SUBSISTEMA 5: Atmosfera/CO2/O2
+  // SUBSISTEMA 5: CO2
   // -----------------------------------------------------------------------
-  if (tempoAtual - ultimoTempoAtmosfera >= INTERVALO_ATMOSFERA && !regaEmCurso && !valvulaAtiva) {
+  if (tempoAtual - ultimoTempoAtmosfera >= INTERVALO_ATMOSFERA
+      && !regaEmCurso && !valvulaAtiva) {
     ultimoTempoAtmosfera = tempoAtual;
     Serial.println("\n[SUBSISTEMA 5 - ATMOSFERA E GESTÃO DE CO2]");
-    
-    float o2Lido = sensorO2Operacional ? oxygen.getOxygenData(20) : o2Simulado_Demo;        
+
+    float o2Lido = sensorO2Operacional ? oxygen.getOxygenData(20) : o2Simulado_Demo;
+
     float co2EstimadoPPM = 400.0 + (21.0 - o2Lido) * 10000.0;
     if (co2EstimadoPPM < 0) co2EstimadoPPM = 400.0;
-
-    Serial.print("-> Dióxido de Carbono Calculado: "); 
-    Serial.print(co2EstimadoPPM, 0); 
-    Serial.println(" ppm");
+    Serial.print("-> CO2: "); Serial.print(co2EstimadoPPM, 0); Serial.println(" ppm");
 
     if (co2EstimadoPPM < 800) {
-      Serial.println("-> ALERTA: CO2 abaixo da meta! Disparando Válvula Solenoide por 4s...");
-      mcp.digitalWrite(PINO_EXP_VALV_CO2, LOW);   // Abre válvula
-      valvulaAtiva = true;
-      tempoInicioValvula = tempoAtual;            // Regista o segundo em que abriu
-      
-      if (!sensorO2Operacional) o2Simulado_Demo = 20.93; 
-    } 
-    else if (co2EstimadoPPM >= 1200) {
-      Serial.println("-> CRÍTICO: CO2 em excesso! Ativando Ventoinha de Extração (IN1)...");
-      mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);  
-      mcp.digitalWrite(PINO_EXP_VENTILACAO, LOW); 
-      if (!sensorO2Operacional) o2Simulado_Demo = 21.05; 
-    } 
-    else {
-      Serial.println("-> Nível de CO2 estável na meta [800 - 1200] ppm.");
-      mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);   
-      mcp.digitalWrite(PINO_EXP_VENTILACAO, HIGH); 
-      if (!sensorO2Operacional) o2Simulado_Demo = 20.85; 
+      Serial.println("-> CO2 baixo! Abrindo válvula 4s...");
+      mcp.digitalWrite(PINO_EXP_VALV_CO2, LOW);
+      valvulaAtiva = true; tempoInicioValvula = tempoAtual;
+      if (!sensorO2Operacional) o2Simulado_Demo = 20.93;
+    } else if (co2EstimadoPPM >= 1200) {
+      Serial.println("-> CO2 em excesso! Extração forçada...");
+      mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);
+      mcp.digitalWrite(PINO_EXP_VENTILACAO, LOW);
+      ventoinhaAtiva = true;
+      if (!sensorO2Operacional) o2Simulado_Demo = 21.05;
+    } else {
+      Serial.println("-> CO2 estável [800-1200 ppm].");
+      mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH);
+      if (!ventoinhaAtiva) mcp.digitalWrite(PINO_EXP_VENTILACAO, HIGH);
+      if (!sensorO2Operacional) o2Simulado_Demo = 20.85;
     }
   }
-
-  
-// Bloco de segurança temporizado (fim do subsistema 5)
-  if (valvulaAtiva && (tempoAtual - tempoInicioValvula >= 4000)) {
-    mcp.digitalWrite(PINO_EXP_VALV_CO2, HIGH); 
-    valvulaAtiva = false;
-    Serial.println("-> [Sucesso]: Injeção temporizada de CO2 concluída. Válvula selada.");
-  }
-} 
+}
